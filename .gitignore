@@ -1,0 +1,10 @@
+# Ignore everything by default, including subfolders
+*
+
+# Keep only root-level docs and PowerShell scripts
+!/*.md
+!/*.ps1
+!/*.cmd
+
+# Keep the ignore rules themselves in the repo
+!.gitignore
