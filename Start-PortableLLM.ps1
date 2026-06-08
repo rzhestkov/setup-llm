@@ -522,7 +522,7 @@ function Quote-Arg {
 #>
 function Start-WebUI {
     param(
-        [string]$WebUIExe,
+        [string]$PythonExe,
         [string]$PackagesDir,
         [string]$DataDir,
         [string]$TempDir,
@@ -530,7 +530,9 @@ function Start-WebUI {
         [int]$Port,
         [string]$LlamaUrl,
         [string]$WorkingDir,
-        [string]$DisableBackgroundTasks
+        [string]$DisableBackgroundTasks,
+        [string]$OutputLog,
+        [string]$ErrorLog
     )
 
     $oldPythonPath = $env:PYTHONPATH
@@ -539,6 +541,8 @@ function Start-WebUI {
     $oldTmp = $env:TMP
     $oldOpenAiBaseUrls = $env:OPENAI_API_BASE_URLS
     $oldOpenAiKeys = $env:OPENAI_API_KEYS
+    $oldPythonUtf8 = $env:PYTHONUTF8
+    $oldPythonIoEncoding = $env:PYTHONIOENCODING
     $backgroundTaskVars = @(
         'ENABLE_TITLE_GENERATION',
         'ENABLE_TAGS_GENERATION',
@@ -560,6 +564,8 @@ function Start-WebUI {
         $env:TMP = $TempDir
         $env:OPENAI_API_BASE_URLS = $LlamaUrl
         $env:OPENAI_API_KEYS = 'none'
+        $env:PYTHONUTF8 = '1'
+        $env:PYTHONIOENCODING = 'utf-8'
 
         if ($DisableBackgroundTasks -match '^(1|true|yes|y|да|д)$') {
             foreach ($name in $backgroundTaskVars) {
@@ -567,8 +573,18 @@ function Start-WebUI {
             }
         }
 
-        $arguments = ('serve --host {0} --port {1}' -f $ListenHost, $Port)
-        return Start-Process -FilePath $WebUIExe -ArgumentList $arguments -WorkingDirectory $WorkingDir -WindowStyle Hidden -PassThru
+        # pip console launchers contain the Python path used during installation.
+        # Invoke the Typer app through the current portable Python so drive-letter changes keep working.
+        $arguments = Convert-ToArgumentLine -CommandArguments @(
+            '-c',
+            'from open_webui import app; app()',
+            'serve',
+            '--host',
+            $ListenHost,
+            '--port',
+            [string]$Port
+        )
+        return Start-Process -FilePath $PythonExe -ArgumentList $arguments -WorkingDirectory $WorkingDir -WindowStyle Hidden -RedirectStandardOutput $OutputLog -RedirectStandardError $ErrorLog -PassThru
     }
     finally {
         $env:PYTHONPATH = $oldPythonPath
@@ -577,6 +593,8 @@ function Start-WebUI {
         $env:TMP = $oldTmp
         $env:OPENAI_API_BASE_URLS = $oldOpenAiBaseUrls
         $env:OPENAI_API_KEYS = $oldOpenAiKeys
+        $env:PYTHONUTF8 = $oldPythonUtf8
+        $env:PYTHONIOENCODING = $oldPythonIoEncoding
         foreach ($name in $backgroundTaskVars) {
             [Environment]::SetEnvironmentVariable($name, $oldBackgroundTaskVars[$name], 'Process')
         }
@@ -597,7 +615,6 @@ try {
     $config = Read-SimpleConfig -Path $configPath
     $pythonExe = Join-PortablePath -Root $root -Value $config['PythonExe']
     $packagesDir = Join-PortablePath -Root $root -Value $config['OpenWebUIPackages']
-    $webUIExe = Join-Path $packagesDir 'bin\open-webui.exe'
     $dataDir = Join-PortablePath -Root $root -Value $config['OpenWebUIData']
     $llamaExe = Join-PortablePath -Root $root -Value $config['LlamaExe']
     $modelsDir = Join-PortablePath -Root $root -Value $config['ModelsDir']
@@ -608,7 +625,6 @@ try {
     Ensure-PythonPackagesPath -PythonExe $pythonExe
     Add-StartupLog -Path $startupLog -Text 'Пути Open WebUI и pywin32 подключены в embedded Python.'
     Assert-ProcessNotRunning -ExePath $llamaExe -DisplayName 'llama-server'
-    Assert-ProcessNotRunning -ExePath $webUIExe -DisplayName 'Open WebUI'
 
     $llamaHost = $config['LlamaHost']
     $webHost = $config['WebUIHost']
@@ -757,11 +773,14 @@ try {
 
     Write-Info 'Запуск Open WebUI...'
     $llamaUrl = ('http://{0}:{1}/v1' -f $llamaHost, $llamaPort)
-    if (-not (Test-Path -LiteralPath $webUIExe)) {
-        throw ("Не найден open-webui.exe: {0}" -f $webUIExe)
+    if (-not (Test-Path -LiteralPath $pythonExe)) {
+        throw ("Не найден portable Python: {0}" -f $pythonExe)
     }
 
-    $web = Start-WebUI -WebUIExe $webUIExe -PackagesDir $packagesDir -DataDir $dataDir -TempDir $tempDir -ListenHost $webHost -Port $webPort -LlamaUrl $llamaUrl -WorkingDir $root -DisableBackgroundTasks $disableOpenWebUIBackgroundTasks
+    $webLog = Join-Path $logsDir 'webui.log'
+    $webErr = Join-Path $logsDir 'webui.err.log'
+    Remove-Item -LiteralPath $webLog, $webErr -ErrorAction SilentlyContinue
+    $web = Start-WebUI -PythonExe $pythonExe -PackagesDir $packagesDir -DataDir $dataDir -TempDir $tempDir -ListenHost $webHost -Port $webPort -LlamaUrl $llamaUrl -WorkingDir $root -DisableBackgroundTasks $disableOpenWebUIBackgroundTasks -OutputLog $webLog -ErrorLog $webErr
     [System.IO.File]::WriteAllText((Join-Path $logsDir 'webui.pid'), [string]$web.Id, (New-Object System.Text.UTF8Encoding($true)))
     Write-Ok ("Open WebUI PID: {0}" -f $web.Id)
     Add-StartupLog -Path $startupLog -Text ('Open WebUI PID: {0}' -f $web.Id)
