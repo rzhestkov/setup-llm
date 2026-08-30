@@ -506,6 +506,118 @@ function Test-ModelVramFit {
     }
 }
 
+<#
+Блок: детальная оценка VRAM штатным llama-fit-params.
+Инструмент читает метаданные модели и рассчитывает отдельно model/context/compute buffers
+для тех же параметров, с которыми будет запущен сервер. Оценка является диагностической
+и не запрещает запуск.
+#>
+function Test-LlamaDetailedVramFit {
+    param(
+        [string]$LlamaExe,
+        [string]$ModelPath,
+        [string]$GpuLayers,
+        [string]$FlashAttention,
+        [string]$CacheTypeK,
+        [string]$CacheTypeV,
+        [string]$SplitMode,
+        [string]$MainGpu,
+        [string]$CtxSize,
+        [string]$BatchSize,
+        [string]$UBatchSize,
+        [string]$Fit,
+        [string]$FitTargetMiB,
+        [string]$FitCtx,
+        [string]$ParallelSlots,
+        [bool]$NoMmap,
+        [bool]$CpuMoe,
+        [string]$NCpuMoe,
+        [string]$LogPath
+    )
+
+    $fitExe = Join-Path (Split-Path -Parent $LlamaExe) 'llama-fit-params.exe'
+    if (-not (Test-Path -LiteralPath $fitExe)) {
+        Add-StartupLog -Path $LogPath -Text 'llama-fit-params.exe не найден; используется грубая оценка VRAM.'
+        return $false
+    }
+
+    $fitArgs = @(
+        '--model', $ModelPath,
+        '--gpu-layers', $GpuLayers,
+        '--flash-attn', $FlashAttention,
+        '--cache-type-k', $CacheTypeK,
+        '--cache-type-v', $CacheTypeV,
+        '--split-mode', $SplitMode,
+        '--main-gpu', $MainGpu,
+        '--ctx-size', $CtxSize,
+        '--batch-size', $BatchSize,
+        '--ubatch-size', $UBatchSize,
+        '--fit', $Fit,
+        '--fit-target', $FitTargetMiB,
+        '--fit-ctx', $FitCtx,
+        '--parallel', $ParallelSlots,
+        '--fit-print', 'on'
+    )
+    if ($NoMmap) { $fitArgs += '--no-mmap' }
+    if ($CpuMoe) { $fitArgs += '--cpu-moe' }
+    if (-not [string]::IsNullOrWhiteSpace($NCpuMoe)) { $fitArgs += @('--n-cpu-moe', $NCpuMoe) }
+
+    try {
+        $probe = Invoke-CapturedProcess -Exe $fitExe -CommandArguments $fitArgs -WorkingDir (Split-Path -Parent $fitExe) -TimeoutSeconds 120
+        Add-StartupLog -Path $LogPath -Text ('llama-fit-params exit code: {0}' -f $probe.ExitCode)
+        foreach ($line in ($probe.Output -split "`r?`n")) {
+            if ($line -match '^(CUDA\d+|Host)\s+\d+\s+\d+\s+\d+') {
+                Add-StartupLog -Path $LogPath -Text ('Memory estimate raw: {0}' -f $line.Trim())
+            }
+        }
+
+        $matches = [regex]::Matches($probe.Output, '(?m)^CUDA\d+\s+(\d+)\s+(\d+)\s+(\d+)\s*$')
+        if ($matches.Count -eq 0) {
+            Add-StartupLog -Path $LogPath -Text 'llama-fit-params не вернул распознаваемую CUDA-оценку; используется грубая оценка.'
+            return $false
+        }
+
+        $modelMiB = 0
+        $contextMiB = 0
+        $computeMiB = 0
+        foreach ($match in $matches) {
+            $modelMiB += [int64]$match.Groups[1].Value
+            $contextMiB += [int64]$match.Groups[2].Value
+            $computeMiB += [int64]$match.Groups[3].Value
+        }
+        $requiredMiB = $modelMiB + $contextMiB + $computeMiB
+        $freeBytes = Get-FreeVramBytes -LogPath $LogPath
+        if (-not $freeBytes) {
+            Write-Info ('Детальная оценка VRAM: model={0} MiB, context={1} MiB, compute={2} MiB, всего={3} MiB.' -f $modelMiB, $contextMiB, $computeMiB, $requiredMiB)
+            return $true
+        }
+
+        $freeMiB = [int64]($freeBytes / 1MB)
+        $remainingMiB = $freeMiB - $requiredMiB
+        $targetText = ($FitTargetMiB -split ',')[0].Trim()
+        [int64]$targetMiB = 0
+        [void][int64]::TryParse($targetText, [ref]$targetMiB)
+        $status = 'safe'
+        if ($remainingMiB -lt 0) { $status = 'oversubscribed' }
+        elseif ($remainingMiB -lt $targetMiB) { $status = 'low VRAM margin' }
+
+        $summary = 'Детальная оценка VRAM: model={0} MiB + context={1} MiB + compute={2} MiB = {3} MiB; свободно={4} MiB; остаток={5} MiB; статус={6}.' -f $modelMiB, $contextMiB, $computeMiB, $requiredMiB, $freeMiB, $remainingMiB, $status
+        Write-Info $summary
+        Add-StartupLog -Path $LogPath -Text $summary
+        if ($status -ne 'safe') {
+            Write-Host ('[WARN] {0}' -f $status) -ForegroundColor Yellow
+            $advice = 'Для увеличения запаса можно изменить CtxSize, CacheTypeK/CacheTypeV, BatchSize/UBatchSize или GpuLayers.'
+            Write-Host ('[WARN] {0}' -f $advice) -ForegroundColor Yellow
+            Add-StartupLog -Path $LogPath -Text $advice
+        }
+        return $true
+    }
+    catch {
+        Add-StartupLog -Path $LogPath -Text ('Детальная оценка VRAM не выполнена: {0}' -f $_.Exception.Message)
+        return $false
+    }
+}
+
 function Quote-Arg {
     param([string]$Value)
 
@@ -636,6 +748,8 @@ try {
     $cudaRequired = Get-ConfigValue -Config $config -Key 'CudaRequired' -DefaultValue 'true'
     $gpuLayers = Get-ConfigValue -Config $config -Key 'GpuLayers' -DefaultValue 'all'
     $flashAttention = Get-ConfigValue -Config $config -Key 'FlashAttention' -DefaultValue 'auto'
+    $cacheTypeK = Get-ConfigValue -Config $config -Key 'CacheTypeK' -DefaultValue 'f16'
+    $cacheTypeV = Get-ConfigValue -Config $config -Key 'CacheTypeV' -DefaultValue 'f16'
     $splitMode = Get-ConfigValue -Config $config -Key 'SplitMode' -DefaultValue 'none'
     $mainGpu = Get-ConfigValue -Config $config -Key 'MainGpu' -DefaultValue '0'
     $ctxSize = Get-ConfigValue -Config $config -Key 'CtxSize' -DefaultValue '16000'
@@ -667,6 +781,7 @@ try {
     Add-StartupLog -Path $startupLog -Text ('CUDA required: {0}' -f $cudaRequired)
     Add-StartupLog -Path $startupLog -Text ('GPU layers: {0}' -f $gpuLayers)
     Add-StartupLog -Path $startupLog -Text ('Context size: {0}' -f $ctxSize)
+    Add-StartupLog -Path $startupLog -Text ('KV cache types: K={0}; V={1}' -f $cacheTypeK, $cacheTypeV)
     Add-StartupLog -Path $startupLog -Text ('Batch size: {0}; ubatch size: {1}' -f $batchSize, $ubatchSize)
     Add-StartupLog -Path $startupLog -Text ('Fit: {0}; fit target MiB: {1}; fit ctx: {2}' -f $fit, $fitTargetMiB, $fitCtx)
     if ([string]::IsNullOrWhiteSpace($maxTokens)) {
@@ -690,7 +805,10 @@ try {
     }
 
     $model = Select-Model -ModelsDir $modelsDir
-    Test-ModelVramFit -ModelPath $model -ReserveGb $vramReserveGb -LogPath $startupLog
+    $detailedVramEstimate = Test-LlamaDetailedVramFit -LlamaExe $llamaExe -ModelPath $model -GpuLayers $gpuLayers -FlashAttention $flashAttention -CacheTypeK $cacheTypeK -CacheTypeV $cacheTypeV -SplitMode $splitMode -MainGpu $mainGpu -CtxSize $ctxSize -BatchSize $batchSize -UBatchSize $ubatchSize -Fit $fit -FitTargetMiB $fitTargetMiB -FitCtx $fitCtx -ParallelSlots $parallelSlots -NoMmap $noMmap -CpuMoe $cpuMoe -NCpuMoe $nCpuMoe -LogPath $startupLog
+    if (-not $detailedVramEstimate) {
+        Test-ModelVramFit -ModelPath $model -ReserveGb $vramReserveGb -LogPath $startupLog
+    }
     $llamaLog = Join-Path $logsDir 'llama.log'
     $llamaErr = Join-Path $logsDir 'llama.err.log'
     Remove-Item -LiteralPath $llamaLog, $llamaErr -ErrorAction SilentlyContinue
@@ -702,6 +820,8 @@ try {
         '--port', [string]$llamaPort,
         '--gpu-layers', $gpuLayers,
         '--flash-attn', $flashAttention,
+        '--cache-type-k', $cacheTypeK,
+        '--cache-type-v', $cacheTypeV,
         '--split-mode', $splitMode,
         '--main-gpu', $mainGpu,
         '--ctx-size', $ctxSize,

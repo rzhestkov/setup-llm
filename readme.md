@@ -44,8 +44,9 @@ PortableLLM - это набор PowerShell-скриптов для развор�
 - CUDA 12 runtime DLL для CUDA-сборки `llama.cpp`;
 - папка для моделей;
 - конфиг;
+- быстрый перезапуск только `llama-server` с временными переопределениями конфигурации;
 - логи;
-- скрипты запуска и остановки.
+- скрипты запуска, быстрого перезапуска модели и полной остановки.
 
 Установка не должна требовать глобального Python, изменения системного `PATH`, установки в `Program Files` или ручного раскладывания файлов по системным папкам.
 
@@ -143,12 +144,14 @@ H:\LLM
 ```text
 LLM\
   Start-PortableLLM.cmd
+  Restart-PortableLLM.cmd
   Stop-PortableLLM.cmd
   OpenWebUI\
     data\
     packages\
   config\
     portablellm.ini
+    restartllm.ini
     installed-versions.txt
   llama.cpp\
     bin\
@@ -157,6 +160,7 @@ LLM\
   python\
   scripts\
     Start-PortableLLM.ps1
+    Restart-PortableLLM.ps1
     Stop-PortableLLM.ps1
   temp\
     downloads\
@@ -212,6 +216,8 @@ LLM\config\portablellm.ini
 ```ini
 GpuLayers=all
 CtxSize=16000
+CacheTypeK=f16
+CacheTypeV=f16
 BatchSize=2048
 UBatchSize=512
 Fit=on
@@ -231,6 +237,7 @@ VramReserveGb=2.0
 
 - `GpuLayers=all` - пытаться выгрузить модель на GPU полностью.
 - `CtxSize=16000` - стартовый размер контекста.
+- `CacheTypeK=f16` и `CacheTypeV=f16` - типы K/V-кэша. Для эксперимента с большим контекстом можно использовать одинаковые `q8_0/q8_0`.
 - `Fit=on` - разрешить `llama.cpp` подбирать некоторые параметры под доступную память.
 - `FitTargetMiB=2048` - желаемый запас VRAM.
 - `ParallelSlots=1` - один активный слот генерации, чтобы не дробить память.
@@ -242,7 +249,64 @@ VramReserveGb=2.0
 - `ReasoningFormat=deepseek` - формат reasoning для Qwen-подобных thinking-моделей.
 - `VramReserveGb=2.0` - запас VRAM для предварительного предупреждения.
 
-После изменения конфига нужно остановить и заново запустить PortableLLM.
+После изменения базового `portablellm.ini` нужно остановить и заново запустить PortableLLM. Для временного эксперимента без перезапуска Open WebUI используйте `restartllm.ini` и быстрый Restart, описанный ниже.
+
+## Быстрый перезапуск модели
+
+`Restart-PortableLLM.cmd` перезапускает только `llama-server`. Open WebUI продолжает работать и после загрузки модели снова обращается к серверу по тому же адресу.
+
+Экспериментальные переопределения задаются в:
+
+```text
+LLM\config\restartllm.ini
+```
+
+Файл может быть пустым. Перед каждым перезапуском скрипт заново объединяет безопасный базовый `portablellm.ini` и `restartllm.ini` в:
+
+```text
+LLM\temp\portablellm_tmp.ini
+```
+
+Если ключ указан в `restartllm.ini`, он заменяет базовое значение. Отсутствующие ключи берутся из `portablellm.ini`; предыдущий временный файл не используется как основа.
+
+Пример:
+
+```ini
+CtxSize=30000
+CacheTypeK=q8_0
+CacheTypeV=q8_0
+BatchSize=512
+UBatchSize=256
+```
+
+Технически overlay может содержать любые параметры без whitelist и дополнительных ограничений. Следует учитывать, что быстрый Restart перезапускает только `llama-server`: уже работающий Open WebUI не перечитывает собственные параметры, а изменение `LlamaPort` может разорвать его текущее подключение.
+
+Последовательность Restart:
+
+1. Собрать effective-конфигурацию и показать различия.
+2. Остановить только `llama-server`.
+3. Подождать освобождения памяти; пауза по умолчанию равна 5 секундам и может быть изменена через `RestartDelaySeconds`.
+4. Предложить обычный выбор модели — можно выбрать прежнюю или другую GGUF.
+5. Выполнить оценку VRAM.
+6. Запустить новый `llama-server`; Open WebUI не перезапускается.
+
+Обычный `Start-PortableLLM.cmd` всегда читает только `portablellm.ini` и возвращает систему к базовым настройкам.
+
+## Улучшенная оценка VRAM
+
+Перед загрузкой Start и Restart пытаются запустить штатный `llama-fit-params.exe` с теми же параметрами модели. В выводе отдельно показываются:
+
+```text
+model + context + compute = всего; свободно; ожидаемый остаток
+```
+
+Статусы:
+
+- `safe` - ожидаемый остаток не меньше `FitTargetMiB`;
+- `low VRAM margin` - модель помещается, но желаемый запас не выдержан;
+- `oversubscribed` - расчёт превышает доступную VRAM.
+
+Оценка не блокирует запуск. Если `llama-fit-params.exe` отсутствует или не возвращает распознаваемый результат, используется прежняя грубая оценка размера GGUF плюс `VramReserveGb`.
 
 ## Проверка, что используется GPU
 
@@ -271,6 +335,7 @@ logs\install.log       Лог установки
 logs\startup.log       Лог запуска
 logs\llama.log         stdout llama-server
 logs\llama.err.log     stderr llama-server и техническая информация
+logs\restart.log       история быстрых перезапусков и переопределений
 logs\cuda-check.log    Проверка CUDA backend
 logs\last-url.txt      Последний URL Open WebUI
 ```

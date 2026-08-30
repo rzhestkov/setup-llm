@@ -158,6 +158,23 @@ function Write-Utf8Bom {
     [System.IO.File]::WriteAllText($Path, $Text, $encoding)
 }
 
+function Copy-PowerShellScript {
+    param(
+        [string]$Source,
+        [string]$Destination
+    )
+
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+        throw ("Не найден PowerShell-скрипт для установки: {0}" -f $Source)
+    }
+
+    # Windows PowerShell 5.1 не распознаёт UTF-8 без BOM автоматически.
+    # Читаем исходник как UTF-8 и всегда записываем установленную копию с BOM.
+    $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    $text = [System.IO.File]::ReadAllText($Source, $utf8)
+    Write-Utf8Bom -Path $Destination -Text $text
+}
+
 function Add-Log {
     param(
         [string]$Path,
@@ -354,7 +371,9 @@ function Convert-ToArgumentLine {
 
 <#
 Блок: запуск внешних команд.
-Вывод pip и Python пишется в install.log, а в консоли остаются только крупные шаги.
+Вывод pip и Python пишется в install.log, а в консоли остаются только крупные шаги и периодический статус.
+stdout и stderr считываются параллельно: последовательное ReadToEnd может заблокироваться,
+если дочерний процесс заполнит буфер второго потока.
 #>
 function Invoke-LoggedCommand {
     param(
@@ -378,9 +397,24 @@ function Invoke-LoggedCommand {
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
     $null = $process.Start()
-    $stdout = $process.StandardOutput.ReadToEnd()
-    $stderr = $process.StandardError.ReadToEnd()
-    $process.WaitForExit()
+
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $statusIntervalSeconds = 30
+    $statusStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    while (-not $process.WaitForExit(1000)) {
+        if ($statusStopwatch.Elapsed.TotalSeconds -ge $statusIntervalSeconds) {
+            $statusText = ("{0}: выполняется, прошло {1:N0} с." -f $StepName, $statusStopwatch.Elapsed.TotalSeconds)
+            Write-Info $statusText
+            Add-Log -Path $LogPath -Text $statusText
+            $statusIntervalSeconds += 30
+        }
+    }
+
+    # Завершаем оба асинхронных чтения до получения ExitCode.
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
     $exitCode = $process.ExitCode
 
     if (-not [string]::IsNullOrWhiteSpace($stdout)) {
@@ -558,6 +592,8 @@ WebUIPort=3000
 CudaRequired=true
 GpuLayers=all
 FlashAttention=auto
+CacheTypeK=f16
+CacheTypeV=f16
 SplitMode=none
 MainGpu=0
 CtxSize=16000
@@ -588,6 +624,38 @@ OpenWebUIPackage=$OpenWebUIPackage
 }
 
 <#
+Блок: шаблон экспериментальных переопределений для быстрого перезапуска llama-server.
+Все строки оставлены комментариями, поэтому первый Restart использует базовый конфиг без изменений.
+#>
+function Save-RestartConfig {
+    param([string]$Path)
+
+    if (Test-Path -LiteralPath $Path) {
+        return
+    }
+
+    $text = @"
+; Экспериментальные переопределения для Restart-PortableLLM.
+; Если файл пуст или содержит только комментарии, используются значения portablellm.ini.
+; Можно указать любой параметр: Key=Value. Проверок и ограничений overlay не выполняет.
+; Параметры llama-server применяются при быстром перезапуске модели.
+; Уже работающий Open WebUI не перечитывает свои параметры при быстром перезапуске.
+; Изменения портов могут разорвать текущее подключение Open WebUI; это рекомендация, не запрет.
+; Каждый portablellm_tmp.ini строится заново из portablellm.ini и этого файла.
+;
+; Примеры — удалите точку с запятой только у нужных строк:
+;CtxSize=30000
+;CacheTypeK=q8_0
+;CacheTypeV=q8_0
+;BatchSize=512
+;UBatchSize=256
+;RestartDelaySeconds=5
+"@
+
+    Write-Utf8Bom -Path $Path -Text ($text.Trim() + "`r`n")
+}
+
+<#
 Блок: основная установка.
 Этот блок идёт линейно: путь, план, папки, Python, Open WebUI, llama.cpp, конфиг.
 #>
@@ -611,6 +679,7 @@ $tempDir = Join-Path $root 'temp'
 $downloadsDir = Join-Path $tempDir 'downloads'
 $installLog = Join-Path $logsDir 'install.log'
 $configPath = Join-Path $configDir $ConfigFileName
+$restartConfigPath = Join-Path $configDir 'restartllm.ini'
 $versionsPath = Join-Path $configDir $VersionsFileName
 
 $directories = @(
@@ -661,6 +730,20 @@ try {
     Invoke-LoggedCommand -Exe $pythonExe -CommandArguments @($getPip) -LogPath $installLog -StepName 'Установка pip'
     Write-Ok 'pip установлен.'
 
+    # get-pip.py больше не гарантирует установку setuptools и wheel.
+    # Они нужны для зависимостей Open WebUI, которые публикуются как исходные архивы.
+    Write-Info 'Подготовка Python-инструментов сборки...'
+    Invoke-LoggedCommand -Exe $pythonExe -CommandArguments @(
+        '-m', 'pip', 'install',
+        '--disable-pip-version-check',
+        '--no-warn-script-location',
+        '--progress-bar', 'off',
+        '--upgrade',
+        'setuptools',
+        'wheel'
+    ) -LogPath $installLog -StepName 'Установка setuptools и wheel'
+    Write-Ok 'Python-инструменты сборки подготовлены.'
+
     Write-Info 'Установка Open WebUI. Подробный вывод пишется в install.log...'
     Reset-PackagesDirectory -PackagesDir $openWebUIPackages
     Invoke-LoggedCommand -Exe $pythonExe -CommandArguments @(
@@ -668,6 +751,7 @@ try {
         '--disable-pip-version-check',
         '--no-warn-script-location',
         '--progress-bar', 'off',
+        '--no-build-isolation',
         '--upgrade',
         '--target', $openWebUIPackages,
         $OpenWebUIPackage
@@ -683,6 +767,7 @@ try {
     Write-Ok 'CUDA runtime подготовлен.'
 
     Save-Config -Path $configPath -OpenWebUIPackage $OpenWebUIPackage
+    Save-RestartConfig -Path $restartConfigPath
 
     $pythonVersion = (& $pythonExe -c "import sys; print('.'.join(map(str, sys.version_info[:3])))" 2>$null | Select-Object -First 1)
     $webUIDist = Get-ChildItem -LiteralPath $openWebUIPackages -Directory -Filter 'open_webui-*.dist-info' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -703,10 +788,12 @@ CUDA runtime ZIP: $($cudaRuntimeZip.Name)
 "@
     Write-Utf8Bom -Path $versionsPath -Text ($versions.Trim() + "`r`n")
 
-    Copy-Item -LiteralPath (Join-Path $ScriptRoot 'Start-PortableLLM.ps1') -Destination $scriptsDir -Force -ErrorAction SilentlyContinue
-    Copy-Item -LiteralPath (Join-Path $ScriptRoot 'Stop-PortableLLM.ps1') -Destination $scriptsDir -Force -ErrorAction SilentlyContinue
+    Copy-PowerShellScript -Source (Join-Path $ScriptRoot 'Start-PortableLLM.ps1') -Destination (Join-Path $scriptsDir 'Start-PortableLLM.ps1')
+    Copy-PowerShellScript -Source (Join-Path $ScriptRoot 'Stop-PortableLLM.ps1') -Destination (Join-Path $scriptsDir 'Stop-PortableLLM.ps1')
+    Copy-PowerShellScript -Source (Join-Path $ScriptRoot 'Restart-PortableLLM.ps1') -Destination (Join-Path $scriptsDir 'Restart-PortableLLM.ps1')
     Copy-Item -LiteralPath (Join-Path $ScriptRoot 'Start-PortableLLM.cmd') -Destination $root -Force -ErrorAction SilentlyContinue
     Copy-Item -LiteralPath (Join-Path $ScriptRoot 'Stop-PortableLLM.cmd') -Destination $root -Force -ErrorAction SilentlyContinue
+    Copy-Item -LiteralPath (Join-Path $ScriptRoot 'Restart-PortableLLM.cmd') -Destination $root -Force -ErrorAction SilentlyContinue
     Add-Log -Path $installLog -Text 'Установка успешно завершена.'
 
     Write-Host ''
@@ -715,6 +802,7 @@ CUDA runtime ZIP: $($cudaRuntimeZip.Name)
     Write-Host ('Конфиг: {0}' -f $configPath)
     Write-Host ('Лог: {0}' -f $installLog)
     Write-Host ('Запуск: {0}' -f (Join-Path $root 'Start-PortableLLM.cmd'))
+    Write-Host ('Быстрый перезапуск модели: {0}' -f (Join-Path $root 'Restart-PortableLLM.cmd'))
     Write-Host ('Останов: {0}' -f (Join-Path $root 'Stop-PortableLLM.cmd'))
 }
 catch {
