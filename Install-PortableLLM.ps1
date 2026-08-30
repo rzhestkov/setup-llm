@@ -625,6 +625,7 @@ CacheTypeK=f16
 CacheTypeV=f16
 SplitMode=none
 MainGpu=0
+ModelAlias=Current model
 CtxSize=16000
 BatchSize=2048
 UBatchSize=512

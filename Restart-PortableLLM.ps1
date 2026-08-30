@@ -751,6 +751,7 @@ try {
     $cacheTypeV = Get-ConfigValue -Config $config -Key 'CacheTypeV' -DefaultValue 'f16'
     $splitMode = Get-ConfigValue -Config $config -Key 'SplitMode' -DefaultValue 'none'
     $mainGpu = Get-ConfigValue -Config $config -Key 'MainGpu' -DefaultValue '0'
+    $modelAlias = Get-ConfigValue -Config $config -Key 'ModelAlias' -DefaultValue 'Current model'
     $ctxSize = Get-ConfigValue -Config $config -Key 'CtxSize' -DefaultValue '16000'
     $batchSize = Get-ConfigValue -Config $config -Key 'BatchSize' -DefaultValue '2048'
     $ubatchSize = Get-ConfigValue -Config $config -Key 'UBatchSize' -DefaultValue '512'
@@ -775,7 +776,7 @@ try {
     $llamaHost = $config['LlamaHost']
     $llamaPort = Get-FreePort -PreferredPort ([int]$config['LlamaPort'])
 
-    Add-RestartLog -Path $restartLog -Text ('Context={0}; KV K={1}; KV V={2}; batch={3}; ubatch={4}; GPU layers={5}' -f $ctxSize, $cacheTypeK, $cacheTypeV, $batchSize, $ubatchSize, $gpuLayers)
+    Add-RestartLog -Path $restartLog -Text ('Model alias={0}; Context={1}; KV K={2}; KV V={3}; batch={4}; ubatch={5}; GPU layers={6}' -f $modelAlias, $ctxSize, $cacheTypeK, $cacheTypeV, $batchSize, $ubatchSize, $gpuLayers)
 
     if ($cudaRequired -match '^(1|true|yes|y|да|д)$') {
         Write-Info 'Проверка CUDA backend llama.cpp...'
@@ -807,6 +808,8 @@ try {
         '--parallel', $parallelSlots,
         '--cache-ram', $promptCacheMiB
     )
+
+    if (-not [string]::IsNullOrWhiteSpace($modelAlias)) { $llamaArgsList += @('--alias', $modelAlias) }
 
     if (-not [string]::IsNullOrWhiteSpace($cacheReuse)) { $llamaArgsList += @('--cache-reuse', $cacheReuse) }
     if ($noContextShift) { $llamaArgsList += '--no-context-shift' }

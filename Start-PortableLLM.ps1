@@ -825,6 +825,7 @@ try {
     $cacheTypeV = Get-ConfigValue -Config $config -Key 'CacheTypeV' -DefaultValue 'f16'
     $splitMode = Get-ConfigValue -Config $config -Key 'SplitMode' -DefaultValue 'none'
     $mainGpu = Get-ConfigValue -Config $config -Key 'MainGpu' -DefaultValue '0'
+    $modelAlias = Get-ConfigValue -Config $config -Key 'ModelAlias' -DefaultValue 'Current model'
     $ctxSize = Get-ConfigValue -Config $config -Key 'CtxSize' -DefaultValue '16000'
     $batchSize = Get-ConfigValue -Config $config -Key 'BatchSize' -DefaultValue '2048'
     $ubatchSize = Get-ConfigValue -Config $config -Key 'UBatchSize' -DefaultValue '512'
@@ -853,6 +854,7 @@ try {
     Add-StartupLog -Path $startupLog -Text ('Open WebUI port: {0}' -f $webPort)
     Add-StartupLog -Path $startupLog -Text ('CUDA required: {0}' -f $cudaRequired)
     Add-StartupLog -Path $startupLog -Text ('GPU layers: {0}' -f $gpuLayers)
+    Add-StartupLog -Path $startupLog -Text ('Model alias: {0}' -f $modelAlias)
     Add-StartupLog -Path $startupLog -Text ('Context size: {0}' -f $ctxSize)
     Add-StartupLog -Path $startupLog -Text ('KV cache types: K={0}; V={1}' -f $cacheTypeK, $cacheTypeV)
     Add-StartupLog -Path $startupLog -Text ('Batch size: {0}; ubatch size: {1}' -f $batchSize, $ubatchSize)
@@ -906,6 +908,10 @@ try {
         '--parallel', $parallelSlots,
         '--cache-ram', $promptCacheMiB
     )
+
+    if (-not [string]::IsNullOrWhiteSpace($modelAlias)) {
+        $llamaArgsList += @('--alias', $modelAlias)
+    }
 
     <#
     Блок: дополнительные параметры llama.cpp.
