@@ -2,10 +2,18 @@
 	'use strict';
 
 	const INFO_BUTTON_SELECTOR = 'button[id^="info-"]';
-	const BADGE_CLASS = 'portablellm-generation-speed';
+	const BADGE_CLASS = 'portablellm-response-metrics';
 	const SPEED_PATTERN = /\bpredicted_per_second\s*:\s*([0-9]+(?:\.[0-9]+)?)/i;
+	const TOTAL_TOKENS_PATTERN = /\btotal_tokens\s*:\s*([0-9]+)/i;
+	const INPUT_TOKENS_PATTERN = /\binput_tokens\s*:\s*([0-9]+)/i;
+	const OUTPUT_TOKENS_PATTERN = /\boutput_tokens\s*:\s*([0-9]+)/i;
+	const RUNTIME_CONFIG_URL = '/static/portablellm-runtime.json';
+	const RUNTIME_CONFIG_REFRESH_MS = 1000;
 
 	let scanScheduled = false;
+	let runtimeConfigRequest = null;
+	let runtimeConfigLoadedAt = 0;
+	let runtimeContextSize = null;
 
 	function findTooltipHost(button) {
 		let element = button;
@@ -19,24 +27,79 @@
 		return null;
 	}
 
-	function readGenerationSpeed(button) {
+	function readTooltipText(button) {
 		const tooltipHost = findTooltipHost(button);
 		const content = tooltipHost?._tippy?.props?.content;
-		let text = '';
 
 		if (typeof content === 'string') {
-			text = content;
-		} else if (content instanceof Element) {
-			text = content.textContent ?? '';
+			return content;
+		}
+		if (content instanceof Element) {
+			return content.textContent ?? '';
 		}
 
-		const match = text.match(SPEED_PATTERN);
+		return '';
+	}
+
+	function readNumber(text, pattern) {
+		const match = text.match(pattern);
 		if (!match) {
 			return null;
 		}
 
-		const speed = Number.parseFloat(match[1]);
-		return Number.isFinite(speed) && speed > 0 ? speed : null;
+		const value = Number.parseFloat(match[1]);
+		return Number.isFinite(value) && value >= 0 ? value : null;
+	}
+
+	function readResponseMetrics(button) {
+		const text = readTooltipText(button);
+		const speed = readNumber(text, SPEED_PATTERN);
+		let totalTokens = readNumber(text, TOTAL_TOKENS_PATTERN);
+
+		if (totalTokens === null) {
+			const inputTokens = readNumber(text, INPUT_TOKENS_PATTERN);
+			const outputTokens = readNumber(text, OUTPUT_TOKENS_PATTERN);
+			if (inputTokens !== null && outputTokens !== null) {
+				totalTokens = inputTokens + outputTokens;
+			}
+		}
+
+		return {
+			speed: speed !== null && speed > 0 ? speed : null,
+			totalTokens
+		};
+	}
+
+	async function refreshRuntimeConfig() {
+		const now = Date.now();
+		if (runtimeConfigRequest) {
+			return runtimeConfigRequest;
+		}
+		if (now - runtimeConfigLoadedAt < RUNTIME_CONFIG_REFRESH_MS) {
+			return runtimeContextSize;
+		}
+
+		runtimeConfigLoadedAt = now;
+		runtimeConfigRequest = fetch(`${RUNTIME_CONFIG_URL}?t=${now}`, { cache: 'no-store' })
+			.then((response) => {
+				if (!response.ok) {
+					throw new Error(`HTTP ${response.status}`);
+				}
+				return response.json();
+			})
+			.then((config) => {
+				const contextSize = Number.parseInt(config.contextSize, 10);
+				if (Number.isFinite(contextSize) && contextSize > 0) {
+					runtimeContextSize = contextSize;
+				}
+				return runtimeContextSize;
+			})
+			.catch(() => runtimeContextSize)
+			.finally(() => {
+				runtimeConfigRequest = null;
+			});
+
+		return runtimeConfigRequest;
 	}
 
 	function formatSpeed(speed) {
@@ -55,15 +118,30 @@
 		);
 	}
 
-	function updateSpeedBadge(button) {
-		const speed = readGenerationSpeed(button);
-		if (speed === null) {
+	function updateMetricsBadge(button) {
+		const metrics = readResponseMetrics(button);
+		const labels = [];
+		const details = [];
+
+		if (metrics.totalTokens !== null && runtimeContextSize !== null) {
+			const usedTokens = Math.round(metrics.totalTokens);
+			labels.push(`${usedTokens}/${runtimeContextSize} ctx`);
+			const usagePercent = (usedTokens / runtimeContextSize) * 100;
+			details.push(
+				`Context: ${usedTokens}/${runtimeContextSize} tokens (${usagePercent.toFixed(1)}%)`
+			);
+		}
+
+		if (metrics.speed !== null) {
+			labels.push(`${formatSpeed(metrics.speed)} tok/s`);
+			details.push(`Generation speed: ${metrics.speed.toFixed(2)} tokens/s`);
+		}
+
+		if (labels.length === 0) {
 			return false;
 		}
 
-		const formattedSpeed = formatSpeed(speed);
 		let badge = findBadge(button.id);
-
 		if (!badge) {
 			const tooltipHost = findTooltipHost(button);
 			if (!tooltipHost) {
@@ -78,15 +156,16 @@
 			tooltipHost.insertAdjacentElement('afterend', badge);
 		}
 
-		badge.textContent = `${formattedSpeed} tok/s`;
-		badge.title = `Generation speed: ${speed.toFixed(2)} tokens/s`;
+		badge.textContent = labels.join(' \u00b7 ');
+		badge.title = details.join('; ');
 		badge.setAttribute('aria-label', badge.title);
 		return true;
 	}
 
-	function scanInfoButtons() {
+	async function scanInfoButtons() {
 		scanScheduled = false;
-		document.querySelectorAll(INFO_BUTTON_SELECTOR).forEach(updateSpeedBadge);
+		await refreshRuntimeConfig();
+		document.querySelectorAll(INFO_BUTTON_SELECTOR).forEach(updateMetricsBadge);
 	}
 
 	function scheduleScan() {
@@ -95,7 +174,9 @@
 		}
 
 		scanScheduled = true;
-		window.requestAnimationFrame(scanInfoButtons);
+		window.requestAnimationFrame(() => {
+			void scanInfoButtons();
+		});
 	}
 
 	function addedNodeContainsInfoButton(node) {

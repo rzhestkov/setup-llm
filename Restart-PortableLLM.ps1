@@ -624,6 +624,79 @@ function Wait-ServicePort {
     throw ('llama-server не открыл порт {0} за {1} секунд.' -f $Port, $TimeoutSeconds)
 }
 
+<#
+Блок: публикация фактического размера контекста для уже работающего Open WebUI.
+llama.cpp может скорректировать запрошенный CtxSize, поэтому используется значение n_ctx из /props.
+#>
+function Get-LlamaContextSize {
+    param(
+        [string]$HostName,
+        [int]$Port,
+        [int]$FallbackContextSize,
+        [string]$LogPath
+    )
+
+    $queryHost = $HostName
+    if ($queryHost -in @('0.0.0.0', '::', '*', '+')) {
+        $queryHost = '127.0.0.1'
+    }
+
+    $propsUrl = ('http://{0}:{1}/props' -f $queryHost, $Port)
+    $deadline = (Get-Date).AddSeconds(15)
+    $lastError = $null
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $props = Invoke-RestMethod -Uri $propsUrl -Method Get -TimeoutSec 3
+            $actualContextSize = [int]$props.default_generation_settings.n_ctx
+            if ($actualContextSize -gt 0) {
+                Add-RestartLog -Path $LogPath -Text ('Фактический размер контекста llama-server: {0}.' -f $actualContextSize)
+                return $actualContextSize
+            }
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+
+        Start-Sleep -Seconds 1
+    }
+
+    Add-RestartLog -Path $LogPath -Text ('Не удалось прочитать /props ({0}). Для индикатора используется CtxSize={1}.' -f $lastError, $FallbackContextSize)
+    return $FallbackContextSize
+}
+
+function Write-OpenWebUIRuntimeConfig {
+    param(
+        [string]$PackagesDir,
+        [int]$ContextSize,
+        [string]$LogPath
+    )
+
+    $payload = [ordered]@{
+        contextSize = $ContextSize
+        updatedAtUtc = [DateTime]::UtcNow.ToString('o')
+    } | ConvertTo-Json -Compress
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $writtenPaths = @()
+
+    foreach ($staticDir in @(
+        (Join-Path $PackagesDir 'open_webui\frontend\static'),
+        (Join-Path $PackagesDir 'open_webui\static')
+    )) {
+        if (Test-Path -LiteralPath $staticDir) {
+            $runtimeConfigPath = Join-Path $staticDir 'portablellm-runtime.json'
+            [System.IO.File]::WriteAllText($runtimeConfigPath, $payload, $utf8NoBom)
+            $writtenPaths += $runtimeConfigPath
+        }
+    }
+
+    if ($writtenPaths.Count -eq 0) {
+        Add-RestartLog -Path $LogPath -Text ('Каталоги Open WebUI static не найдены в {0}; индикатор контекста будет недоступен.' -f $PackagesDir)
+        return
+    }
+
+    Add-RestartLog -Path $LogPath -Text ('Runtime-конфиг Open WebUI обновлён: contextSize={0}.' -f $ContextSize)
+}
+
 $restartLog = $null
 try {
     $root = Resolve-Root
@@ -636,6 +709,7 @@ try {
     $baseConfig = Read-SimpleConfig -Path $baseConfigPath
     $baseLogsDir = Join-PortablePath -Root $root -Value $baseConfig['LogsDir']
     $baseTempDir = Join-PortablePath -Root $root -Value $baseConfig['TempDir']
+    $basePackagesDir = Join-PortablePath -Root $root -Value $baseConfig['OpenWebUIPackages']
     if (-not (Test-Path -LiteralPath $baseLogsDir)) { $null = New-Item -ItemType Directory -Path $baseLogsDir -Force }
     if (-not (Test-Path -LiteralPath $baseTempDir)) { $null = New-Item -ItemType Directory -Path $baseTempDir -Force }
 
@@ -764,6 +838,8 @@ try {
 
     Write-Info 'Ожидание готовности llama-server...'
     Wait-ServicePort -Process $llama -HostName $llamaHost -Port $llamaPort -TimeoutSeconds 120 -LogPath $restartLog
+    $actualCtxSize = Get-LlamaContextSize -HostName $llamaHost -Port $llamaPort -FallbackContextSize ([int]$ctxSize) -LogPath $restartLog
+    Write-OpenWebUIRuntimeConfig -PackagesDir $basePackagesDir -ContextSize $actualCtxSize -LogPath $restartLog
     Write-Ok 'llama-server готов. Open WebUI не перезапускался.'
     Add-RestartLog -Path $restartLog -Text 'Перезапуск успешно завершён.'
 }
