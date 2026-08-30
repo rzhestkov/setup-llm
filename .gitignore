@@ -1,10 +1,11 @@
 # Ignore everything by default, including subfolders
 *
 
-# Keep only root-level docs and PowerShell scripts
+# Keep only the root-level project sources
 !/*.md
 !/*.ps1
 !/*.cmd
+!/OpenWebUI-loader.js
 
 # Keep the ignore rules themselves in the repo
 !.gitignore

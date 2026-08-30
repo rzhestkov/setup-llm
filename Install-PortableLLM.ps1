@@ -25,6 +25,7 @@ $GetPipUrl = 'https://bootstrap.pypa.io/get-pip.py'
 $PythonZipName = 'python-3.12.3-embed-amd64.zip'
 $ConfigFileName = 'portablellm.ini'
 $VersionsFileName = 'installed-versions.txt'
+$OpenWebUILoaderFileName = 'OpenWebUI-loader.js'
 
 <#
 Блок: простые сообщения.
@@ -173,6 +174,34 @@ function Copy-PowerShellScript {
     $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
     $text = [System.IO.File]::ReadAllText($Source, $utf8)
     Write-Utf8Bom -Path $Destination -Text $text
+}
+
+function Install-OpenWebUICustomizations {
+    param(
+        [string]$PackagesDir,
+        [string]$LoaderSource,
+        [string]$PortableCopyPath
+    )
+
+    if (-not (Test-Path -LiteralPath $LoaderSource -PathType Leaf)) {
+        throw ("Не найден файл доработки Open WebUI: {0}" -f $LoaderSource)
+    }
+
+    $openWebUIRoot = Join-Path $PackagesDir 'open_webui'
+    if (-not (Test-Path -LiteralPath $openWebUIRoot -PathType Container)) {
+        throw ("Не найден каталог установленного Open WebUI: {0}" -f $openWebUIRoot)
+    }
+
+    $loaderTargets = @(
+        (Join-Path $openWebUIRoot 'frontend\static\loader.js'),
+        (Join-Path $openWebUIRoot 'static\loader.js'),
+        $PortableCopyPath
+    )
+
+    foreach ($target in $loaderTargets) {
+        Ensure-Directory -Path (Split-Path -Parent $target)
+        Copy-Item -LiteralPath $LoaderSource -Destination $target -Force
+    }
 }
 
 function Add-Log {
@@ -757,6 +786,13 @@ try {
         $OpenWebUIPackage
     ) -LogPath $installLog -StepName 'Установка Open WebUI'
     Write-Ok 'Open WebUI установлен.'
+
+    Write-Info 'Добавление итоговой скорости генерации в Open WebUI...'
+    Install-OpenWebUICustomizations `
+        -PackagesDir $openWebUIPackages `
+        -LoaderSource (Join-Path $ScriptRoot $OpenWebUILoaderFileName) `
+        -PortableCopyPath (Join-Path $scriptsDir $OpenWebUILoaderFileName)
+    Write-Ok 'Индикатор скорости Open WebUI добавлен.'
 
     Write-Info 'Распаковка llama.cpp...'
     Install-LlamaCpp -ZipPath $llamaZip.FullName -TempDir $tempDir -BinDir $llamaBin

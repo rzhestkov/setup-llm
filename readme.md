@@ -115,6 +115,7 @@ Start-PortableLLM.cmd       CMD-обертка запуска для корня 
 Start-PortableLLM.ps1       PowerShell-скрипт запуска
 Stop-PortableLLM.cmd        CMD-обертка остановки для корня portable-папки
 Stop-PortableLLM.ps1        PowerShell-скрипт остановки
+OpenWebUI-loader.js         Вывод итоговой скорости генерации в Open WebUI
 readme.md                   Документация
 todo.md                     Рабочее техническое задание и заметки
 ```
@@ -159,6 +160,7 @@ LLM\
   models\
   python\
   scripts\
+    OpenWebUI-loader.js
     Start-PortableLLM.ps1
     Restart-PortableLLM.ps1
     Stop-PortableLLM.ps1
@@ -190,6 +192,8 @@ LLM\Start-PortableLLM.cmd
 - запустит `llama-server`;
 - запустит Open WebUI;
 - покажет локальный URL, например `http://127.0.0.1:3000`.
+
+После завершения ответа Open WebUI показывает рядом с кнопками сообщения общую скорость генерации, например `15.8 tok/s`. Значение включает весь выход модели: рассуждение и финальный ответ.
 
 Если порт `3000` занят, будет автоматически выбран следующий свободный порт, например `3001`.
 
